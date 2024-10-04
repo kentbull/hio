@@ -43,7 +43,7 @@ from setuptools import setup
 
 
 setup(
-    name='hio',
+    name='cit-hio',
     version='0.6.14',  #  also change in src/hio/__init__.py
     license='Apache Software License 2.0',
     description='Hierarchical Concurrency with Async IO',
