@@ -79,8 +79,10 @@ class Requestant(httping.Parsent):
             if connection and "keep-alive" in connection.lower():
                 self.persisted = True
 
-        if self.persisted:  # override timeout so server never timesout
-            self.remoter.tymeout =  0.0  # never timesout
+        # Keep-alive (persisted) only means the connection may be reused for
+        # another request. Do not disable remoter.tymeout: idle connections must
+        # still expire via Server.serviceConnects() so sockets cannot accumulate
+        # forever. Remoter.refreshable still restarts the timer on rx/tx activity.
 
 
     def parseHead(self):

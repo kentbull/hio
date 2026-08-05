@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-One-shot demonstration that HTTP/1.1 keep-alive disables idle tymeout in hio.
+Demonstrate keep-alive idle timeout behavior in hio.
 
-Run from repo root (with hio importable):
+Run from repo root (with hio importable, preferably this tree on PYTHONPATH):
 
-  python scripts/prove_keepalive_idle_timeout.py
+  PYTHONPATH=src python scripts/prove_keepalive_idle_timeout.py
 
 Or with the tests:
 
@@ -48,15 +48,18 @@ def prove_unit() -> None:
     print(f"  version          = {req.version}")
     print(f"  persisted        = {req.persisted}")
     print(f"  remoter.tymeout  = {remoter.tymeout}  (was 5.0 before parse)")
-    if req.persisted and remoter.tymeout == 0.0:
-        print("  RESULT: BUG CONFIRMED — keep-alive zeroed idle tymeout")
+    if req.persisted and remoter.tymeout == 5.0:
+        print("  RESULT: OK — keep-alive preserved idle tymeout")
+    elif req.persisted and remoter.tymeout == 0.0:
+        print("  RESULT: BUG STILL PRESENT — keep-alive zeroed idle tymeout")
+        sys.exit(2)
     else:
-        print("  RESULT: unexpected (bug may already be fixed)")
+        print("  RESULT: unexpected")
         sys.exit(2)
 
 
 def prove_server() -> None:
-    section("2) Integration: WSGI server keeps idle keep-alive after tymeout")
+    section("2) Integration: idle keep-alive is pruned after tymeout")
 
     def app(environ, start_response):
         body = b"ok"
@@ -68,7 +71,6 @@ def prove_server() -> None:
 
     tymist = tyming.Tymist(tyme=0.0)
     idle = 0.5
-    # fixed high port for demo; pytest suite uses ephemeral ports
     port = 16111
 
     with http.openServer(
@@ -90,8 +92,6 @@ def prove_server() -> None:
             for _ in range(200):
                 alpha.service()
                 beta.service()
-                # Do not require alpha.idle(): keep-alive remoters stay open, so
-                # idle() may remain False after a successful response.
                 if beta.responses and alpha.servant.ixes:
                     break
                 time.sleep(0.01)
@@ -101,7 +101,8 @@ def prove_server() -> None:
 
             remoter = list(alpha.servant.ixes.values())[0]
             print(f"  after request: ixes={len(alpha.servant.ixes)} "
-                  f"tymeout={remoter.tymeout}")
+                  f"tymeout={remoter.tymeout} "
+                  f"persisted={list(alpha.reqs.values())[0].persisted}")
 
             for _ in range(20):
                 tymist.tick(tock=0.1)
@@ -110,10 +111,72 @@ def prove_server() -> None:
             print(f"  after tyme={tymist.tyme:.1f}s "
                   f"(idle tymeout was {idle}s): "
                   f"ixes={len(alpha.servant.ixes)}")
-            if len(alpha.servant.ixes) == 1:
-                print("  RESULT: BUG CONFIRMED — idle keep-alive not pruned")
+            if len(alpha.servant.ixes) == 0:
+                print("  RESULT: OK — idle keep-alive pruned after tymeout")
             else:
-                print("  RESULT: unexpected close (bug may already be fixed)")
+                print("  RESULT: BUG STILL PRESENT — idle keep-alive not pruned")
+                sys.exit(2)
+
+
+def prove_reuse() -> None:
+    section("3) Legitimate keep-alive: second request reuses connection")
+
+    def app(environ, start_response):
+        body = b"ok"
+        start_response(
+            "200 OK",
+            [("Content-type", "text/plain"), ("Content-length", str(len(body)))],
+        )
+        return [body]
+
+    tymist = tyming.Tymist(tyme=0.0)
+    idle = 2.0
+    port = 16112
+
+    with http.openServer(
+        port=port, app=app, tymeout=idle, tymth=tymist.tymen()
+    ) as alpha:
+        path = f"http://127.0.0.1:{port}/"
+        with http.openClient(
+            path=path, tymth=tymist.tymen(), reconnectable=False
+        ) as beta:
+            req = dict(
+                method="GET",
+                path="/",
+                qargs={},
+                fragment="",
+                headers={"Accept": "text/plain", "Content-Length": 0},
+            )
+            beta.requests.append(dict(req))
+            for _ in range(200):
+                alpha.service()
+                beta.service()
+                if beta.responses and alpha.servant.ixes:
+                    break
+                time.sleep(0.01)
+            else:
+                print("  ERROR: first request did not complete")
+                sys.exit(1)
+
+            ca = next(iter(alpha.servant.ixes))
+            beta.responses.clear()
+            beta.requests.append(dict(req))
+            for _ in range(200):
+                alpha.service()
+                beta.service()
+                if beta.responses:
+                    break
+                time.sleep(0.01)
+            else:
+                print("  ERROR: second request did not complete")
+                sys.exit(1)
+
+            print(f"  responses=2 path, same ca present={ca in alpha.servant.ixes}, "
+                  f"ixes={len(alpha.servant.ixes)}")
+            if ca in alpha.servant.ixes and len(alpha.servant.ixes) == 1:
+                print("  RESULT: OK — connection reused for second request")
+            else:
+                print("  RESULT: unexpected connection handling")
                 sys.exit(2)
 
 
@@ -128,13 +191,12 @@ def main() -> None:
 
     prove_unit()
     prove_server()
+    prove_reuse()
 
     section("Summary")
     print(
-        "Root cause: Requestant.checkPersisted() sets remoter.tymeout=0.0 when\n"
-        "persisted (HTTP/1.1 keep-alive). Server.serviceConnects() only closes\n"
-        "when ix.tymeout > 0.0 and ix.tymer.expired — so idle sockets never die.\n"
-        "\n"
+        "Keep-alive still reuses connections while active.\n"
+        "Idle connections expire after server tymeout.\n"
         "See tests/core/http/test_idle_timeout_keepalive.py"
     )
 
