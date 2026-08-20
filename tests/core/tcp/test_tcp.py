@@ -10,11 +10,99 @@ import sys
 import os
 import time
 import socket
+import struct
 from collections import deque
 import ssl
 
 from hio.base import tyming, doing
 from hio.core import tcp
+
+
+@pytest.mark.parametrize(
+    "server_cls, remoter_attr",
+    ((tcp.Server, "ixes"), (tcp.ServerTls, "cxes")),
+    ids=("tcp", "tls"),
+)
+def test_server_discards_reset_accepted_socket(server_cls, remoter_attr):
+    """
+    Test a peer reset between accept and conversion to a Remoter.
+    """
+    tymist = tyming.Tymist()
+    server = server_cls(tymth=tymist.tymen(), ha=("127.0.0.1", 0))
+    assert server.reopen()
+
+    # Acceptor does not refresh .eha after binding an ephemeral port.
+    server.eha = server.ha
+    resetter = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    healthy = None
+    dead = None
+
+    try:
+        resetter.connect(server.ha)
+
+        deadline = time.monotonic() + 1.0
+        while not server.axes and time.monotonic() < deadline:
+            server.serviceAccepts()
+            time.sleep(0.01)
+
+        assert len(server.axes) == 1
+        dead, reset_ca = server.axes[0]
+
+        # Closing with a zero linger interval sends a TCP RST.
+        linger_format = "hh" if sys.platform.startswith("win") else "ii"
+        resetter.setsockopt(socket.SOL_SOCKET,
+                            socket.SO_LINGER,
+                            struct.pack(linger_format, 1, 0))
+        resetter.close()
+        resetter = None
+
+        # Wait until the accepted socket observes the reset before servicing it.
+        reset_error = None
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
+            try:
+                dead.getpeername()
+            except OSError as ex:
+                reset_error = ex
+                break
+            time.sleep(0.01)
+
+        assert reset_error is not None
+
+        server.serviceAxes()
+
+        remoters = getattr(server, remoter_attr)
+        assert dead.fileno() == -1
+        assert reset_ca not in remoters
+        assert server.opened
+        assert server.ss.fileno() != -1
+
+        healthy = socket.create_connection(server.ha)
+        healthy_ca = healthy.getsockname()
+
+        deadline = time.monotonic() + 1.0
+        while healthy_ca not in remoters and time.monotonic() < deadline:
+            server.serviceAxes()
+            time.sleep(0.01)
+
+        assert healthy_ca in remoters
+        assert remoters[healthy_ca].ca == healthy_ca
+        assert remoters[healthy_ca].cs.getpeername() == healthy_ca
+        assert server.opened
+
+    finally:
+        if resetter is not None:
+            resetter.close()
+        if healthy is not None:
+            healthy.close()
+        if dead is not None and dead.fileno() != -1:
+            dead.close()
+        if isinstance(server, tcp.ServerTls):
+            for remoter in server.cxes.values():
+                remoter.close()
+            server.cxes.clear()
+        server.close()
+
 
 def test_tcp_basic():
     """
