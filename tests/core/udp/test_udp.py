@@ -21,30 +21,27 @@ def test_udp_basic():
     tymist = tyming.Tymist()
     with (wiring.openWL(samed=True, filed=True) as wl):
 
-        alpha = udping.Peer(port = 6101, wl=wl)  # any interface on port 6101
-        if platform.system() == 'Windows':
-            alpha = udping.Peer(ha=('127.0.0.1', 6101), wl=wl)
+        # macOS Tahoe does not allow UDP sends to the wildcard address.
+        host = '127.0.0.1'
+        alphaPort = 6101
+        betaPort = 6102
+        alphaHa = (host, alphaPort)
+        betaHa = (host, betaPort)
+
+        alpha = udping.Peer(host=host, port=alphaPort, wl=wl)
         assert not alpha.opened
         assert alpha.name == 'main'  # default
         assert alpha.reopen()
         assert alpha.opened
-        if platform.system() == 'Windows':
-            assert alpha.ha == ('127.0.0.1', 6101)
-        else:
-            assert alpha.ha == ('0.0.0.0', 6101)
+        assert alpha.ha == alphaHa
 
-        beta = udping.Peer(name='beta',port = 6102, wl=wl)  # any interface on port 6102
-        if platform.system() == 'Windows':
-            beta = udping.Peer(name='beta', ha=('127.0.0.1', 6102), wl=wl)
+        beta = udping.Peer(name='beta', host=host, port=betaPort, wl=wl)
 
         assert not beta.opened
         assert beta.name == 'beta'
         assert beta.reopen()
         assert beta.opened
-        if platform.system() == 'Windows':
-            assert beta.ha == ('127.0.0.1', 6102)
-        else:
-            assert beta.ha == ('0.0.0.0', 6102)
+        assert beta.ha == betaHa
 
         msgOut = b"alpha sends to beta"
         alpha.send(msgOut, beta.ha)
@@ -110,8 +107,12 @@ def test_open_peer():
     """
     tymist = tyming.Tymist()
 
-    alphaHa = ('127.0.0.1', 6101) if platform.system() == 'Windows' else ('0.0.0.0', 6101)
-    betaHa = ('127.0.0.1', 6102) if platform.system() == 'Windows' else ('0.0.0.0', 6102)
+    # macOS Tahoe does not allow UDP sends to the wildcard address.
+    host = '127.0.0.1'
+    alphaPort = 6101
+    betaPort = 6102
+    alphaHa = (host, alphaPort)
+    betaHa = (host, betaPort)
 
     with (wiring.openWL(samed=True, filed=True) as wl,
 
@@ -119,16 +120,10 @@ def test_open_peer():
           udping.openPeer(ha=betaHa, wl=wl) as beta):  # any interface on port 6102
 
         assert alpha.opened
-        if platform.system() == 'Windows':
-            assert alpha.ha == ('127.0.0.1', 6101)
-        else:
-            assert alpha.ha == ('0.0.0.0', 6101)
+        assert alpha.ha == alphaHa
 
         assert beta.opened
-        if platform.system() == 'Windows':
-            assert beta.ha == ('127.0.0.1', 6102)
-        else:
-            assert beta.ha == ('0.0.0.0', 6102)
+        assert beta.ha == betaHa
 
         msgOut = b"alpha sends to beta"
         alpha.send(msgOut, beta.ha)
