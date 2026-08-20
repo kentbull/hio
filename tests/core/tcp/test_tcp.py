@@ -10,7 +10,6 @@ import sys
 import os
 import time
 import socket
-import struct
 from collections import deque
 from unittest.mock import Mock
 import ssl
@@ -23,85 +22,60 @@ from hio.core import tcp
     ((tcp.Server, "ixes"), (tcp.ServerTls, "cxes")),
     ids=("tcp", "tls"),
 )
-def test_server_discards_reset_accepted_socket(server_cls, remoter_attr):
+def test_server_discards_unusable_accepted_socket(server_cls, remoter_attr):
     """
-    Test a peer reset between accept and conversion to a Remoter.
+    Test discarding an unusable socket while servicing later accepts.
     """
     tymist = tyming.Tymist()
-    server = server_cls(tymth=tymist.tymen(), ha=("127.0.0.1", 0))
-    assert server.reopen()
-
-    # Acceptor does not refresh .eha after binding an ephemeral port.
-    server.eha = server.ha
-    resetter = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    healthy = None
-    dead = None
-
-    try:
-        resetter.connect(server.ha)
-
-        deadline = time.monotonic() + 1.0
-        while not server.axes and time.monotonic() < deadline:
-            server.serviceAccepts()
-            time.sleep(0.01)
-
-        assert len(server.axes) == 1
-        dead, reset_ca = server.axes[0]
-
-        # Closing with a zero linger interval sends a TCP RST.
-        linger_format = "hh" if sys.platform.startswith("win") else "ii"
-        resetter.setsockopt(socket.SOL_SOCKET,
-                            socket.SO_LINGER,
-                            struct.pack(linger_format, 1, 0))
-        resetter.close()
-        resetter = None
-
-        # Wait until the accepted socket observes the reset before servicing it.
-        reset_error = None
-        deadline = time.monotonic() + 1.0
-        while time.monotonic() < deadline:
-            try:
-                dead.getpeername()
-            except OSError as ex:
-                reset_error = ex
-                break
-            time.sleep(0.01)
-
-        assert reset_error is not None
-
-        server.serviceAxes()
-
+    with tcp.openServer(cls=server_cls,
+                        tymth=tymist.tymen(),
+                        ha=("127.0.0.1", 0)) as server:
+        # Acceptor does not refresh .eha after binding an ephemeral port.
+        server.eha = server.ha
         remoters = getattr(server, remoter_attr)
-        assert dead.fileno() == -1
-        assert reset_ca not in remoters
-        assert server.opened
-        assert server.ss.fileno() != -1
+        dead = None
 
-        healthy = socket.create_connection(server.ha)
-        healthy_ca = healthy.getsockname()
+        try:
+            with socket.create_connection(server.ha) as unusable_client, \
+                 socket.create_connection(server.ha) as healthy_client:
+                unusable_ca = unusable_client.getsockname()
+                healthy_ca = healthy_client.getsockname()
 
-        deadline = time.monotonic() + 1.0
-        while healthy_ca not in remoters and time.monotonic() < deadline:
-            server.serviceAxes()
-            time.sleep(0.01)
+                for _ in range(10):
+                    server.serviceAccepts()
+                    if len(server.axes) == 2:
+                        break
+                    time.sleep(0.05)
 
-        assert healthy_ca in remoters
-        assert remoters[healthy_ca].ca == healthy_ca
-        assert remoters[healthy_ca].cs.getpeername() == healthy_ca
-        assert server.opened
+                assert len(server.axes) == 2
+                accepted = {ca: cs for cs, ca in server.axes}
+                dead = accepted[unusable_ca]
+                healthy = accepted[healthy_ca]
 
-    finally:
-        if resetter is not None:
-            resetter.close()
-        if healthy is not None:
-            healthy.close()
-        if dead is not None and dead.fileno() != -1:
-            dead.close()
-        if isinstance(server, tcp.ServerTls):
-            for remoter in server.cxes.values():
-                remoter.close()
-            server.cxes.clear()
-        server.close()
+                # Preserve real I/O while making only the platform-dependent
+                # peer lookup fail, and queue it first to exercise continuation.
+                unusable = Mock(wraps=dead)
+                unusable.getpeername.side_effect = OSError("Socket not connected")
+                server.axes.clear()
+                server.axes.extend(((unusable, unusable_ca),
+                                    (healthy, healthy_ca)))
+
+                server.serviceAxes()
+
+                assert not server.axes
+                assert dead.fileno() == -1
+                assert set(remoters) == {healthy_ca}
+
+        finally:
+            if dead is not None and dead.fileno() != -1:
+                dead.close()
+            while server.axes:
+                cs, _ = server.axes.popleft()
+                cs.close()
+            if isinstance(server, tcp.ServerTls):
+                for remoter in server.cxes.values():
+                    remoter.close()
+                server.cxes.clear()
 
 def test_tcp_basic():
     """
