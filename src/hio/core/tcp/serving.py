@@ -692,7 +692,8 @@ class Remoter(tyming.Tymee):
         """
         Reset idle tymer from current tyme.
         """
-        self.tymer.start()
+        if self.tymer.tyme is not None:
+            self.tymer.start()
 
 
     def receive(self):

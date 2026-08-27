@@ -52,6 +52,11 @@ def test_remoter_refresh_resets_idle_tymeout():
     assert remoter.tymer.duration == 1.0
     assert remoter.tymer.remaining == pytest.approx(1.0)
 
+    # Remoters without an injected tyme base have no idle time to refresh.
+    unwound = tcp.Remoter(ha=remoter.ha, ca=remoter.ca, cs=None)
+    unwound.refresh()
+    assert unwound.tymer.duration == 0.0
+
 
 def test_tcp_basic():
     """
