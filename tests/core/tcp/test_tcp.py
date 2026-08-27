@@ -16,6 +16,43 @@ import ssl
 from hio.base import tyming, doing
 from hio.core import tcp
 
+
+def test_remoter_refresh_resets_idle_tymeout():
+    """Test Remoter activity resets its idle tymer from current tyme."""
+    tymist = tyming.Tymist()
+    remoter = tcp.Remoter(
+        tymth=tymist.tymen(),
+        ha=("127.0.0.1", 56000),
+        ca=("127.0.0.1", 56001),
+        cs=None,
+        tymeout=1.0,
+    )
+
+    assert remoter.tymer.duration == 1.0
+    assert remoter.tymer.remaining == 1.0
+
+    tymist.tick(tock=0.75)
+    assert remoter.tymer.remaining == 0.25
+
+    remoter.refresh()
+    assert remoter.tymer.duration == 1.0
+    assert remoter.tymer.remaining == pytest.approx(1.0)
+
+    # Multiple activity notifications at the same tyme must not accumulate
+    # additional idle-time credit.
+    remoter.refresh()
+    assert remoter.tymer.remaining == pytest.approx(1.0)
+
+    tymist.tick(tock=1.25)
+    assert remoter.tymer.expired
+
+    # Activity after expiration starts a new full idle interval.
+    remoter.refresh()
+    assert not remoter.tymer.expired
+    assert remoter.tymer.duration == 1.0
+    assert remoter.tymer.remaining == pytest.approx(1.0)
+
+
 def test_tcp_basic():
     """
     Test the tcp connection between client and server
