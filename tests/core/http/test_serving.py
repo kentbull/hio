@@ -7,6 +7,7 @@ import sys
 import os
 import socket
 import time
+from contextlib import contextmanager
 
 import pytest
 
@@ -24,6 +25,36 @@ tlsdirpath = os.path.dirname(
                         os.path.abspath(
                             sys.modules.get(__name__).__file__)))
 certdirpath = os.path.join(tlsdirpath, 'tls', 'certs')
+
+
+@contextmanager
+def _open_wsgi_pair(app, server_class=serving.Server, tymeout=0.0,
+                    close_tymeout=None):
+    """Open a real loopback WSGI server and raw TCP client pair."""
+    tymist = tyming.Tymist(tyme=0.0)
+    with tcp.openServer(ha=("127.0.0.1", 0),
+                        tymeout=tymeout,
+                        tymth=tymist.tymen()) as servant:
+        servant.eha = servant.ha
+        with tcp.openClient(ha=servant.ha,
+                            tymth=tymist.tymen()) as client:
+            for _ in range(100):
+                client.serviceConnect()
+                servant.serviceConnects()
+                if client.connected and client.ca in servant.ixes:
+                    break
+                time.sleep(0.01)
+            assert client.connected
+            assert client.ca in servant.ixes
+
+            server = server_class(app=app,
+                                  servant=servant,
+                                  ha=servant.ha,
+                                  closeTymeout=close_tymeout)
+            try:
+                yield tymist, server, client, servant, servant.ixes[client.ca]
+            finally:
+                server.close()
 
 
 def _requestant_waiting_for_chunk_body():
@@ -192,6 +223,51 @@ def test_wsgi_server_does_not_rearm_closed_request_with_pipeline_suffix():
             assert requestant.path == "/one"
             assert requestant.msg.startswith(b"GET /two")
             assert calls == ["/one"]
+
+
+def test_wsgi_server_honors_response_connection_close():
+    """A response close token forbids reuse of a persistent request socket."""
+    calls = []
+
+    def app(environ, start_response):
+        calls.append(environ["PATH_INFO"])
+        start_response("200 OK", [("Content-Length", "0"),
+                                  ("Connection", "close")])
+        return []
+
+    messages = (b"GET /one HTTP/1.1\r\nHost: localhost\r\n\r\n"
+                b"GET /two HTTP/1.1\r\nHost: localhost\r\n\r\n")
+
+    with _open_wsgi_pair(app) as (_, server, client, servant, remoter):
+        # Buffer both requests so an incorrect rearm can expose /two.
+        client.tx(messages)
+        for _ in range(100):
+            client.serviceSends()
+            servant.serviceReceivesAllIx()
+            if not client.txbs and bytes(remoter.rxbs) == messages:
+                break
+            time.sleep(0.01)
+        assert bytes(remoter.rxbs) == messages
+
+        # Complete /one and inspect admission before transmitting its response.
+        server.serviceConnects()
+        server.serviceReqs()
+        server.serviceReps()
+        requestant = server.reqs[client.ca]
+        assert requestant.persisted
+        assert server.reps[client.ca].ended
+        assert requestant.parser is None
+        assert requestant.msg.startswith(b"GET /two")
+
+        # Drain the completed response; /two must never reach the application.
+        for _ in range(100):
+            server.service()
+            client.serviceReceives()
+            if client.ca not in servant.ixes:
+                break
+            time.sleep(0.01)
+        assert client.ca not in servant.ixes
+        assert calls == ["/one"]
 
 
 def test_requestant_chunked_eof_consumes_terminal_zero_chunk():

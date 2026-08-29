@@ -919,7 +919,11 @@ class Server():
 
             if responder.ended:
                 requestant = self.reqs[ca]
-                if requestant.persisted:
+                connection = responder.headers.get("connection")
+                persisted = (requestant.persisted and
+                             not (connection and
+                                  "close" in connection.lower()))
+                if persisted:
                     if requestant.parser is None and not requestant.closed:  # reuse
                         requestant.makeParser()  # resets requestant parser
                 else:  # not persistent so close and remove requestant and responder
