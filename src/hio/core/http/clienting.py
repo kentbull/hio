@@ -29,6 +29,15 @@ CR = b"\r"
 Response = namedtuple('Response', 'version status reason headers body data request errored error')
 
 
+def _validateByteLimit(name, value):
+    """Validate an optional non-negative integer byte limit."""
+    if value is not None and (isinstance(value, bool) or
+                              not isinstance(value, int) or
+                              value < 0):
+        raise ValueError("{0} must be a non-negative integer or None".format(name))
+    return value
+
+
 #  Class Definitions
 
 class Requester(object):
@@ -297,6 +306,7 @@ class Respondent(httping.Parsent):
                  events=None,
                  retry=None,
                  leid=None,
+                 bodyLimit=None,
                  **kwa):
         """
         Initialize Instance:
@@ -323,6 +333,9 @@ class Respondent(httping.Parsent):
         self.retry = retry if retry is not None else self.Retry  # retry timeout in milliseconds if evented
         self.leid = None  # non None if evented with event ids sent
         self.eventSource = None  # httping.EventSource instance when .evented
+        self.bodyLimit = _validateByteLimit("bodyLimit", bodyLimit)
+        self.bodyBytes = 0
+        self.limitExceeded = False
 
 
     def reinit(self,
@@ -340,6 +353,26 @@ class Respondent(httping.Parsent):
         self.code = None
         self.reason = None
         self.evented = None
+        self.bodyBytes = 0
+        self.limitExceeded = False
+
+
+    def _rejectBody(self):
+        """Mark an oversized response terminal before retaining more body."""
+        self.limitExceeded = True
+        del self.body[:]
+        raise httping.HTTPException("response body limit exceeded")
+
+
+    def _checkChunkSize(self):
+        """Reject an oversized declared chunk before its bytes are retained."""
+        line, separator, _ = self.msg.partition(CRLF)
+        if not separator:
+            return False
+        size = int(line.partition(b';')[0].strip().decode('ascii'), 16)
+        if self.bodyBytes + size > self.bodyLimit:
+            self._rejectBody()
+        return True
 
 
     def close(self):
@@ -486,6 +519,10 @@ class Respondent(httping.Parsent):
                 (self.method == "HEAD")):
             self.length = 0
 
+        if (self.bodyLimit is not None and self.length is not None and
+                self.length > self.bodyLimit):
+            self._rejectBody()
+
         contentType = self.headers.get("content-type")
         if contentType:
             if u';' in contentType: # should also parse out charset for decoding
@@ -536,6 +573,12 @@ class Respondent(httping.Parsent):
         if self.chunked:  # content-length is ignored if chunked
             self.parms = dict()
             while True:  # parse all chunks here
+                if self.bodyLimit is not None:
+                    while not self._checkChunkSize():
+                        if self.closed and not self.msg:
+                            raise httping.PrematureClosure("Connection closed "
+                                    "unexpectedly while parsing response body chunk")
+                        (yield None)
                 chunkParser = httping.parseChunk(raw=self.msg)
                 while True:  # parse another chunk
                     if self.closed and not self.msg:  # connection closed prematurely
@@ -553,6 +596,7 @@ class Respondent(httping.Parsent):
                     self.parms.update(parms)
 
                 if size:  # size non zero so append chunk but keep iterating
+                    self.bodyBytes += size
                     self.body.extend(chunk)
                     if self.evented:
                         self.eventSource.parse()  # parse events here
@@ -582,10 +626,15 @@ class Respondent(httping.Parsent):
 
             self.body = self.msg[:self.length]
             del self.msg[:self.length]
+            self.bodyBytes = self.length
 
         else:  # unknown content length so parse forever until closed
             while True:
                 if self.msg:
+                    if (self.bodyLimit is not None and
+                            self.bodyBytes + len(self.msg) > self.bodyLimit):
+                        self._rejectBody()
+                    self.bodyBytes += len(self.msg)
                     self.body.extend(self.msg[:])
                     del self.msg[:]  # python2 bytearrays dont have clear self.msg.clear()
 
@@ -675,6 +724,7 @@ class Client():
                  redirects=None,
                  responses=None,
                  portOptional=False,
+                 responseBodyLimit=None,
                  **kwa):
         """
         Initialization method for instance.
@@ -717,6 +767,8 @@ class Client():
                  each response is dict
             portOptional = True indicates to leave off port 80 for http or
                  443 for https in Host header to support non-compliant server implementations.
+            responseBodyLimit is the maximum decoded response body bytes to
+                retain, or None for the legacy unbounded behavior.
 
             **kwa are passed through to init .connector tcp.Client or tcp.ClientTLS
         """
@@ -730,6 +782,8 @@ class Client():
         self.events = events if events is not None else deque()
         self.waited = False  # Boolean True If sent request but waiting for response
         self.latest = None  # latest request dict from .requests in process if any
+        self.responseBodyLimit = _validateByteLimit("responseBodyLimit",
+                                                    responseBodyLimit)
 
         # see if path also includes scheme, netloc, host, port, query, fragment
         splits = urlsplit(path)
@@ -837,9 +891,12 @@ class Client():
                                     dictable=dictable,
                                     events=self.events,
                                     redirectable=redirectable,
-                                    redirects=self.redirects)
+                                    redirects=self.redirects,
+                                    bodyLimit=self.responseBodyLimit)
         else:
             # do we need to assign the events, redirects also?
+            if self.responseBodyLimit is not None:
+                respondent.bodyLimit = self.responseBodyLimit
             respondent.reinit(msg=self.connector.rxbs,
                               method=method,
                               dictable=dictable,
@@ -1086,6 +1143,9 @@ class Client():
                 self.respondent.ended = True
 
             if self.respondent.ended:
+                if self.respondent.limitExceeded:
+                    del self.connector.rxbs[:]
+                    self.connector.close()
                 self.respondent.dictify()
 
                 if not self.respondent.evented:

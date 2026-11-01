@@ -9,6 +9,7 @@ import os
 import io
 import json
 import copy
+import math
 import datetime
 import mimetypes
 
@@ -16,7 +17,7 @@ from urllib.parse import urlsplit, unquote, quote
 from contextlib import contextmanager
 
 from ... import help
-from ...base import doing
+from ...base import doing, tyming
 from .. import tcp
 
 from . import httping
@@ -29,6 +30,37 @@ LF = b"\n"
 CR = b"\r"
 
 
+def _validateByteLimit(name, value):
+    """Validate an optional non-negative integer byte limit."""
+    if value is not None and (isinstance(value, bool) or
+                              not isinstance(value, int) or
+                              value < 0):
+        raise ValueError("{0} must be a non-negative integer or None".format(name))
+    return value
+
+
+def _validateTimeout(name, value):
+    """Validate an optional non-negative request duration."""
+    if value is not None and (isinstance(value, bool) or
+                              not isinstance(value, (int, float)) or
+                              value < 0.0 or
+                              not math.isfinite(value)):
+        raise ValueError("{0} must be a non-negative number or None".format(name))
+    return value
+
+
+def _errorResponse(status, reason):
+    """Build a finite HTTP/1.1 error response that requires connection close."""
+    body = "{0} {1}\n".format(status, reason).encode("ascii")
+    lines = ["HTTP/1.1 {0} {1}".format(status, reason).encode("ascii"),
+             b"Connection: close",
+             b"Content-Type: text/plain; charset=utf-8",
+             "Content-Length: {0}".format(len(body)).encode("ascii"),
+             b"",
+             b""]
+    return CRLF.join(lines) + body
+
+
 #  Class Definitions
 
 class Requestant(httping.Parsent):
@@ -37,7 +69,12 @@ class Requestant(httping.Parsent):
     Parses request msg
     """
 
-    def __init__(self, remoter=None, **kwa):
+    def __init__(self,
+                 remoter=None,
+                 headerLimit=None,
+                 bodyLimit=None,
+                 requestTimeout=None,
+                 **kwa):
         """
         Initialize Instance
         Parameters:
@@ -46,6 +83,14 @@ class Requestant(httping.Parsent):
         """
         super(Requestant, self).__init__(**kwa)
         self.remoter = remoter
+        self.headerLimit = _validateByteLimit("headerLimit", headerLimit)
+        self.bodyLimit = _validateByteLimit("bodyLimit", bodyLimit)
+        self.requestTimeout = _validateTimeout("requestTimeout", requestTimeout)
+        self.requestTymer = None
+        self.headerBytes = 0
+        self.bodyBytes = 0
+        self.rejection = None
+        self.rejectionQueued = False
         self.url = u''   # full path in request line either relative or absolute
         self.scheme = u''  # scheme used in request line path
         self.hostname = u''  # hostname used in request line path
@@ -54,6 +99,83 @@ class Requestant(httping.Parsent):
         self.query = u'' # query string from full path
         self.fragment = u''  # fragment from full path
         # self.headers = None  # never received a request
+
+
+    def makeParser(self, msg=None):
+        """Reset per-request limit state and create a fresh parser."""
+        super(Requestant, self).makeParser(msg=msg)
+        if hasattr(self, "headerBytes"):
+            self.requestTymer = None
+            self.headerBytes = 0
+            self.bodyBytes = 0
+            self.rejection = None
+            self.rejectionQueued = False
+
+
+    def startRequest(self):
+        """Start the absolute request timer on the first received byte."""
+        if (self.requestTimeout is not None and self.requestTymer is None and
+                self.msg):
+            self.requestTymer = tyming.Tymer(tymth=self.remoter.tymth,
+                                             duration=self.requestTimeout)
+
+
+    def reject(self, status, reason, detail):
+        """Mark this request as rejected without exposing it to the app."""
+        if self.rejection is None:
+            self.rejection = (status, reason)
+            self.errored = True
+            self.error = detail
+            self.persisted = False
+
+
+    def checkLimits(self):
+        """Check buffered headers and deadline while a request is parsing."""
+        if self.parser is None:
+            return
+
+        self.startRequest()
+        if self.requestTymer is not None and self.requestTymer.expired:
+            self.reject(httping.REQUEST_TIMEOUT,
+                        httping.STATUS_DESCRIPTIONS[httping.REQUEST_TIMEOUT],
+                        "request deadline exceeded")
+            return
+
+        if self.headerLimit is not None and not self.headed:
+            remaining = len(self.msg)
+            endings = ((self.msg.find(b"\r\n\r\n"), 4),
+                       (self.msg.find(b"\n\n"), 2),
+                       (self.msg.find(b"\r\n\n"), 3),
+                       (self.msg.find(b"\n\r\n"), 3))
+            completed = [index + size for index, size in endings if index >= 0]
+            if completed:
+                remaining = min(completed)
+            if self.headerBytes + remaining > self.headerLimit:
+                self.reject(httping.REQUEST_HEADER_FIELDS_TOO_LARGE,
+                            "Request Header Fields Too Large",
+                            "request header limit exceeded")
+
+
+    def _checkHeaderBytes(self):
+        if self.headerLimit is not None and self.headerBytes > self.headerLimit:
+            self.reject(httping.REQUEST_HEADER_FIELDS_TOO_LARGE,
+                        "Request Header Fields Too Large",
+                        "request header limit exceeded")
+            raise httping.HTTPException(self.error)
+
+
+    def _checkChunkSize(self):
+        """Reject an oversized declared chunk before its bytes are retained."""
+        line, separator, _ = self.msg.partition(CRLF)
+        if not separator:
+            return False
+        size = int(line.partition(b';')[0].strip().decode('ascii'), 16)
+        if self.bodyBytes + size > self.bodyLimit:
+            self.reject(httping.REQUEST_ENTITY_TOO_LARGE,
+                        httping.STATUS_DESCRIPTIONS[httping.REQUEST_ENTITY_TOO_LARGE],
+                        "request body limit exceeded")
+            raise httping.HTTPException(self.error)
+        return True
 
     def checkPersisted(self):
         """
@@ -101,7 +223,10 @@ class Requestant(httping.Parsent):
                 raise httping.PrematureClosure("Connection closed unexpectedly "
                                                "while parsing request start line")
 
+            before = len(self.msg)
             line = next(lineParser)
+            self.headerBytes += before - len(self.msg)
+            self._checkHeaderBytes()
             if line is None:
                 (yield None)
                 continue
@@ -138,7 +263,10 @@ class Requestant(httping.Parsent):
                 raise httping.PrematureClosure("Connection closed unexpectedly "
                                                "while parsing request header")
 
+            before = len(self.msg)
             headers = next(leaderParser)
+            self.headerBytes += before - len(self.msg)
+            self._checkHeaderBytes()
             if headers is not None:
                 leaderParser.close()
                 break
@@ -167,6 +295,13 @@ class Requestant(httping.Parsent):
                 self.length = 0  # assume no body so length 0
         else: # ignore content-length if chunked
             self.length = None
+
+        if (self.bodyLimit is not None and self.length is not None and
+                self.length > self.bodyLimit):
+            self.reject(httping.REQUEST_ENTITY_TOO_LARGE,
+                        httping.STATUS_DESCRIPTIONS[httping.REQUEST_ENTITY_TOO_LARGE],
+                        "request body limit exceeded")
+            raise httping.HTTPException(self.error)
 
         contentType = self.headers.get("content-type")
         if contentType:
@@ -206,6 +341,12 @@ class Requestant(httping.Parsent):
                     raise httping.PrematureClosure("Connection closed unexpectedly"
                                                    " while parsing request body chunk")
 
+                if self.bodyLimit is not None:
+                    while not self._checkChunkSize():
+                        if self.closed and not self.msg:
+                            raise httping.PrematureClosure("Connection closed "
+                                    "unexpectedly while parsing request body chunk")
+                        (yield None)
                 chunkParser = httping.parseChunk(raw=self.msg)
                 while True:  # parse another chunk
                     result = next(chunkParser)
@@ -220,6 +361,7 @@ class Requestant(httping.Parsent):
                     self.parms.update(parms)
 
                 if size:  # size non zero so append chunk but keep iterating
+                    self.bodyBytes += size
                     self.body.extend(chunk)
 
                     if self.closed:  # no more data so finish
@@ -242,6 +384,7 @@ class Requestant(httping.Parsent):
 
             self.body = self.msg[:self.length]
             del self.msg[:self.length]
+            self.bodyBytes = self.length
 
         else:  # unknown content length invalid
             raise httping.HTTPException("Invalid body, content-length not provided!")
@@ -528,6 +671,9 @@ class Server():
                  eha=None,
                  scheme=u'',
                  tymeout=None,
+                 requestHeaderLimit=None,
+                 requestBodyLimit=None,
+                 requestTimeout=None,
                  **kwa):
         """
         Initialization method for instance.
@@ -568,6 +714,11 @@ class Server():
         self.reqs.clear()  # items should only be assigned by valet
         self.reps = reps if reps is not None else dict()  # allows external view
         self.reps.clear()  # items should only be assigned by valet
+        self.requestHeaderLimit = _validateByteLimit(
+            "requestHeaderLimit", requestHeaderLimit)
+        self.requestBodyLimit = _validateByteLimit(
+            "requestBodyLimit", requestBodyLimit)
+        self.requestTimeout = _validateTimeout("requestTimeout", requestTimeout)
 
         if tymeout is None:
             tymeout = self.Tymeout
@@ -729,7 +880,17 @@ class Server():
             if ca in self.servant.ixes:
                 self.servant.ixes[ca].serviceSends()  #  send final bytes to socket
             del self.reps[ca]
-        self.servant.removeIx(ca)
+        if ca in self.servant.ixes:
+            self.servant.removeIx(ca)
+
+
+    def rejectRequest(self, ca, requestant):
+        """Queue one finite rejection response and close after it drains."""
+        if requestant.rejectionQueued or ca not in self.servant.ixes:
+            return
+        status, reason = requestant.rejection
+        self.servant.ixes[ca].tx(_errorResponse(status, reason))
+        requestant.rejectionQueued = True
 
 
     def serviceConnects(self):
@@ -745,9 +906,15 @@ class Server():
                 continue
 
             if ca not in self.reqs:  # point requestant.msg to incomer.rxbs
-                self.reqs[ca] = Requestant(msg=ix.rxbs, remoter=ix)
+                self.reqs[ca] = Requestant(
+                    msg=ix.rxbs,
+                    remoter=ix,
+                    headerLimit=self.requestHeaderLimit,
+                    bodyLimit=self.requestBodyLimit,
+                    requestTimeout=self.requestTimeout)
 
-            if ix.tymeout > 0.0 and ix.tymer.expired:
+            if (ix.tymeout > 0.0 and ix.tymer.tymth is not None and
+                    ix.tymer.expired):
                 self.closeConnection(ca)
 
 
@@ -756,6 +923,15 @@ class Server():
         Service pending requestants
         """
         for ca, requestant in list(self.reqs.items()):
+            if ca not in self.servant.ixes:
+                self.closeConnection(ca)
+                continue
+
+            requestant.checkLimits()
+            if requestant.rejection is not None:
+                self.rejectRequest(ca, requestant)
+                continue
+
             if requestant.parser:
                 try:
                     requestant.parse()
@@ -768,6 +944,9 @@ class Server():
                     continue  # give up on request since shouldn't be here
 
                 if requestant.ended:
+                    if requestant.rejection is not None:
+                        self.rejectRequest(ca, requestant)
+                        continue
                     if requestant.errored:  # parse may swallow error but set .errored and .error
                         sys.stderr.write(requestant.error)
                         self.closeConnection(ca)
@@ -813,6 +992,11 @@ class Server():
                     ix = self.servant.ixes[ca]
                     if not ix.txbs:  # wait for outgoing txbs to be empty
                         self.closeConnection(ca)
+
+        for ca, requestant in list(self.reqs.items()):
+            if (requestant.rejectionQueued and ca in self.servant.ixes and
+                    not self.servant.ixes[ca].txbs):
+                self.closeConnection(ca)
 
     def service(self):
         """
@@ -955,7 +1139,10 @@ class Steward():
                  remoter,
                  requestant=None,
                  responder=None,
-                 dictable=False):
+                 dictable=False,
+                 requestHeaderLimit=None,
+                 requestBodyLimit=None,
+                 requestTimeout=None):
         """
         incomer = Incomer instance for connection
         requestant = Requestant instance for connection
@@ -966,7 +1153,10 @@ class Steward():
         if requestant is None:
             requestant = Requestant(msg=self.remoter.rxbs,
                                     remoter=remoter,
-                                    dictable=dictable)
+                                    dictable=dictable,
+                                    headerLimit=requestHeaderLimit,
+                                    bodyLimit=requestBodyLimit,
+                                    requestTimeout=requestTimeout)
         self.requestant = requestant
 
         if responder is None:
@@ -1054,6 +1244,9 @@ class BareServer():
                  scheme=u'',
                  dictable=False,
                  timeout=None,
+                 requestHeaderLimit=None,
+                 requestBodyLimit=None,
+                 requestTimeout=None,
                  **kwa):
         """
         Initialization method for instance.
@@ -1077,6 +1270,11 @@ class BareServer():
         """
         self.stewards = stewards if stewards is not None else dict()
         self.dictable = True if dictable else False  # for stewards
+        self.requestHeaderLimit = _validateByteLimit(
+            "requestHeaderLimit", requestHeaderLimit)
+        self.requestBodyLimit = _validateByteLimit(
+            "requestBodyLimit", requestBodyLimit)
+        self.requestTimeout = _validateTimeout("requestTimeout", requestTimeout)
         if timeout is None:
             timeout = self.Timeout
 
@@ -1171,8 +1369,10 @@ class BareServer():
         """
         Close and remove connection and associated steward given by ca
         """
-        self.servant.removeIx(ca)
-        del self.stewards[ca]
+        if ca in self.servant.ixes:
+            self.servant.removeIx(ca)
+        if ca in self.stewards:
+            del self.stewards[ca]
 
 
     def serviceConnects(self):
@@ -1186,9 +1386,15 @@ class BareServer():
             # check for and handle cutoff connections by client here
 
             if ca not in self.stewards:
-                self.stewards[ca] = Steward(remoter=ix, dictable=self.dictable)
+                self.stewards[ca] = Steward(
+                    remoter=ix,
+                    dictable=self.dictable,
+                    requestHeaderLimit=self.requestHeaderLimit,
+                    requestBodyLimit=self.requestBodyLimit,
+                    requestTimeout=self.requestTimeout)
 
-            if ix.tymeout > 0.0 and ix.tymer.expired:
+            if (ix.tymeout > 0.0 and ix.tymer.tymth is not None and
+                    ix.tymer.expired):
                 self.closeConnection(ca)
 
 
@@ -1196,27 +1402,48 @@ class BareServer():
         """
         Service pending requestants and responders
         """
-        for ca, steward in self.stewards.items():
-            if not steward.waited:
-                steward.requestant.parse()
+        for ca, steward in list(self.stewards.items()):
+            if ca not in self.servant.ixes:
+                self.closeConnection(ca)
+                continue
 
-                if steward.requestant.ended:
-                    steward.requestant.dictify()
+            requestant = steward.requestant
+            requestant.checkLimits()
+            if requestant.rejection is not None:
+                if not requestant.rejectionQueued:
+                    status, reason = requestant.rejection
+                    steward.remoter.tx(_errorResponse(status, reason))
+                    requestant.rejectionQueued = True
+                elif not steward.remoter.txbs:
+                    self.closeConnection(ca)
+                continue
+
+            if not steward.waited:
+                requestant.parse()
+
+                if requestant.rejection is not None:
+                    status, reason = requestant.rejection
+                    steward.remoter.tx(_errorResponse(status, reason))
+                    requestant.rejectionQueued = True
+                    continue
+
+                if requestant.ended:
+                    requestant.dictify()
                     logger.info("Parsed Request: %s %s %s",
-                                steward.requestant.method,
-                                steward.requestant.path,
-                                steward.requestant.version)
+                                requestant.method,
+                                requestant.path,
+                                requestant.version)
                     logger.debug("Headers/Body:\n%s\n%s\n",
-                                steward.requestant.headers,
-                                steward.requestant.body)
+                                requestant.headers,
+                                requestant.body)
                     steward.respond()
 
             if steward.waited:
                 steward.pour()
 
-            if not steward.waited and steward.requestant.ended:
-                if steward.requestant.persisted:
-                    steward.requestant.makeParser()  #set up for next time
+            if not steward.waited and requestant.ended:
+                if requestant.persisted:
+                    requestant.makeParser()  #set up for next time
                 else:  # remove and close connection
                     self.closeConnection(ca)
 

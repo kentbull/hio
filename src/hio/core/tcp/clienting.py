@@ -19,6 +19,16 @@ from .. import coring, wiring
 
 logger = help.ogler.getLogger()
 
+
+def _validateLimit(name, value):
+    """Validate optional non-negative integer resource limit."""
+    if value is not None and (isinstance(value, bool) or
+                              not isinstance(value, int) or
+                              value < 0):
+        raise ValueError("{0} must be a non-negative integer or None".format(name))
+    return value
+
+
 @contextmanager
 def openClient(cls=None, **kwa):
     """
@@ -74,6 +84,7 @@ class Client(tyming.Tymee):
                  bs=8096,
                  txbs=None,
                  rxbs=None,
+                 rxbsLimit=None,
                  wl=None,
                  **kwa):
         """
@@ -90,6 +101,7 @@ class Client(tyming.Tymee):
             bs = buffer size
             txbs = bytearray of data to send
             rxbs = bytearray of data received
+            rxbsLimit = optional maximum unread receive bytes
             wl = WireLog object if any
         """
         super(Client, self).__init__(**kwa)
@@ -112,6 +124,8 @@ class Client(tyming.Tymee):
         self.bs = bs
         self.txbs = txbs if txbs is not None else bytearray()  # byte array of data to send
         self.rxbs = rxbs if rxbs is not None else bytearray()  # byte array of data recieved
+        self.rxbsLimit = _validateLimit("rxbsLimit", rxbsLimit)
+        self.rxbsOverflowed = False
         self.wl = wl
 
 
@@ -211,6 +225,7 @@ class Client(tyming.Tymee):
         self.accepted = False
         self.connected = False
         self.cutoff = False
+        self.rxbsOverflowed = False
 
         #create connection socket
         self.cs = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -355,7 +370,7 @@ class Client(tyming.Tymee):
         return self.connected
 
 
-    def receive(self):
+    def receive(self, size=None):
         """
         Perform non blocking receive from connected socket .cs
 
@@ -365,7 +380,7 @@ class Client(tyming.Tymee):
         data is string in python2 and bytes in python3
         """
         try:
-            data = self.cs.recv(self.bs)
+            data = self.cs.recv(self.bs if size is None else size)
         except OSError as ex:
             # ex.args[0] == ex.errno for better os compatibility.
             # the value of a given errno.XXXXX may be different on each os
@@ -403,8 +418,19 @@ class Client(tyming.Tymee):
         Service receives until no more
         """
         while self.connected and not self.cutoff:
-            data = self.receive()
+            if self.rxbsLimit is None:
+                data = self.receive()  # preserve legacy subclass call contract
+            else:
+                available = self.rxbsLimit - len(self.rxbs)
+                data = self.receive(size=min(self.bs, available)
+                                    if available > 0 else 1)
             if not data:
+                break
+            if (self.rxbsLimit is not None and
+                    len(self.rxbs) + len(data) > self.rxbsLimit):
+                self.rxbsOverflowed = True
+                self.cutoff = True
+                self.close()
                 break
             self.rxbs.extend(data)
 
@@ -414,9 +440,20 @@ class Client(tyming.Tymee):
         Retrieve from server only one reception
         '''
         if self.connected and not self.cutoff:
-            data = self.receive()
+            if self.rxbsLimit is None:
+                data = self.receive()  # preserve legacy subclass call contract
+            else:
+                available = self.rxbsLimit - len(self.rxbs)
+                data = self.receive(size=min(self.bs, available)
+                                    if available > 0 else 1)
             if data:
-                self.rxbs.extend(data)
+                if (self.rxbsLimit is not None and
+                        len(self.rxbs) + len(data) > self.rxbsLimit):
+                    self.rxbsOverflowed = True
+                    self.cutoff = True
+                    self.close()
+                else:
+                    self.rxbs.extend(data)
 
 
     def clearRxbs(self):
@@ -666,7 +703,7 @@ class ClientTls(Client):
 
         return self.connected
 
-    def receive(self):
+    def receive(self, size=None):
         """
         Perform non blocking receive from connected socket .cs
 
@@ -676,7 +713,7 @@ class ClientTls(Client):
         data is string in python2 and bytes in python3
         """
         try:
-            data = self.cs.recv(self.bs)
+            data = self.cs.recv(self.bs if size is None else size)
         except OSError as ex:  # ssl.SSLError is a subtype of OSError
             # ex.args[0] == ex.errno for better os compatibility.
             # the value of a given errno.XXXXX may be different on each os
