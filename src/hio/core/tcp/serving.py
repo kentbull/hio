@@ -281,7 +281,7 @@ class Server(Acceptor):
                               cs=cs,
                               bs=self.bs,
                               wl=self.wl,
-                              timeout=self.tymeout)
+                              tymeout=self.tymeout)
             if ca in self.ixes and self.ixes[ca] is not remoter:
                 self.shutdownIx(ca)
             self.ixes[ca] = remoter
@@ -566,7 +566,7 @@ class ServerTls(Server):
                                  bs=self.bs,
                                  cs=cs,
                                  wl=self.wl,
-                                 timeout=self.tymeout,
+                                 tymeout=self.tymeout,
                                  context=self.context,
                                  version=self.version,
                                  certify=self.certify,
@@ -646,7 +646,8 @@ class Remoter(tyming.Tymee):
             self.cs.setblocking(0)  # linux does not preserve blocking from accept
         self.tymeout = tymeout if tymeout is not None else self.Tymeout
         self.tymer = tyming.Tymer(tymth=self.tymth, duration=self.tymeout)
-        self.cutoff = False # True when detect connection closed on far side
+        self.cutoff = False # True when receive direction is closed
+        self.txCutoff = False  # True when send direction is closed
         self.refreshable = refreshable
         self.bs = bs
         self.txbs = bytearray()  # bytearray of data to send
@@ -672,6 +673,11 @@ class Remoter(tyming.Tymee):
                 self.cs.shutdown(how)  # shutdown socket
             except OSError as ex:
                 pass
+
+        if how in (socket.SHUT_RD, socket.SHUT_RDWR):
+            self.cutoff = True
+        if how in (socket.SHUT_WR, socket.SHUT_RDWR):
+            self.txCutoff = True
 
 
     def shutdownSend(self):
@@ -738,7 +744,8 @@ class Remoter(tyming.Tymee):
                                 errno.EHOSTDOWN,
                                 errno.ETIMEDOUT,
                                 errno.ECONNREFUSED):
-                self.cutoff = True  # this signals need to close/reopen connection
+                self.cutoff = True
+                self.txCutoff = True
                 return bytes()  # data empty
             else:  # unexpected error
                 logger.error("Unexpected error on receive on %s.\n%s\n", self.cs.getpeername(), ex)
@@ -799,6 +806,12 @@ class Remoter(tyming.Tymee):
             # the value of a given errno.XXXXX may be different on each os
             if ex.args[0] in (errno.EAGAIN, errno.EWOULDBLOCK):
                 count = 0  # blocked try again
+            # BrokenPipeError covers EPIPE and ESHUTDOWN across platforms.
+            elif isinstance(ex, BrokenPipeError):
+                if self.txCutoff:
+                    raise
+                self.txCutoff = True
+                count = 0
             elif ex.args[0] in (errno.ECONNRESET,
                                 errno.ENETRESET,
                                 errno.ENETUNREACH,
@@ -807,7 +820,8 @@ class Remoter(tyming.Tymee):
                                 errno.EHOSTDOWN,
                                 errno.ETIMEDOUT,
                                 errno.ECONNREFUSED):
-                self.cutoff = True  # this signals need to close/reopen connection
+                self.cutoff = True
+                self.txCutoff = True
                 count = 0
             else:
                 raise
@@ -836,7 +850,7 @@ class Remoter(tyming.Tymee):
         or no more to send
         If partial send reattach and return
         """
-        while self.txbs and not self.cutoff:
+        while self.txbs and not self.txCutoff:
             count = self.send(self.txbs)
             del self.txbs[:count]
             break  # try again later
@@ -978,7 +992,8 @@ class RemoterTls(Remoter):
                                 errno.ETIMEDOUT,
                                 errno.ECONNREFUSED,
                                 ssl.SSLEOFError):
-                self.cutoff = True  # this signals need to close/reopen connection
+                self.cutoff = True
+                self.txCutoff = True
                 return bytes()  # data empty
             else:
                 logger.error("Unexpected error on receive on %s.\n%s\n", self.cs.getpeername(), ex)
@@ -990,6 +1005,7 @@ class RemoterTls(Remoter):
 
         else:  # data empty so connection closed on other end
             self.cutoff = True
+            self.txCutoff = True
 
         return data
 
@@ -1017,7 +1033,8 @@ class RemoterTls(Remoter):
                                 errno.ETIMEDOUT,
                                 errno.ECONNREFUSED,
                                 ssl.SSLEOFError):
-                self.cutoff = True  # this signals need to close/reopen connection
+                self.cutoff = True
+                self.txCutoff = True
                 result = 0
             else:
                 raise
