@@ -16,6 +16,24 @@ import ssl
 from hio.base import tyming, doing
 from hio.core import tcp
 
+
+def test_remoter_refresh_resets_idle_tymeout_from_current_tyme():
+    tymist = tyming.Tymist()
+    remoter = tcp.Remoter(
+        tymth=tymist.tymen(),
+        ha=("127.0.0.1", 56000),
+        ca=("127.0.0.1", 56001),
+        cs=None,
+        tymeout=1.0,
+    )
+
+    tymist.tick(tock=0.75)
+    remoter.refresh()
+    remoter.refresh()
+
+    assert remoter.tymer.remaining == pytest.approx(1.0)
+
+
 def test_tcp_basic():
     """
     Test the tcp connection between client and server
