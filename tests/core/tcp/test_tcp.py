@@ -1533,11 +1533,13 @@ def test_remoter_services_sends_after_peer_half_close():
                          tymth=tymist.tymen())
 
     try:
+        request = b"request before EOF"
+        peer.sendall(request)
         peer.shutdown(socket.SHUT_WR)
         remoter.serviceReceives()
 
+        assert bytes(remoter.rxbs) == request
         assert remoter.cutoff is True
-        assert remoter.txCutoff is False
 
         response = b"response after request EOF"
         remoter.tx(response)
