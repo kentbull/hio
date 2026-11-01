@@ -731,6 +731,11 @@ def  test_tcp_tls_default_context():
         assert ixBeta.ca == beta.ca
         assert ixBeta.ha == beta.ha
 
+        ixBeta.tymeout = 1.0
+        remaining = []
+
+        ixBeta.tymer.start(duration=ixBeta.tymeout)
+        tymist.tick(tock=0.75)
         msgOut = b"Beta sends to Server\n"
         beta.tx(msgOut)
         while not( not beta.txbs and ixBeta.rxbs):
@@ -743,8 +748,11 @@ def  test_tcp_tls_default_context():
 
         msgIn = bytes(ixBeta.rxbs)
         assert msgIn == msgOut
+        remaining.append(ixBeta.tymer.remaining)
         ixBeta.clearRxbs()
 
+        ixBeta.tymer.start(duration=ixBeta.tymeout)
+        tymist.tick(tock=0.75)
         msgOut = b'Server sends to Beta\n'
         ixBeta.tx(msgOut)
         while not (not ixBeta.txbs and beta.rxbs):
@@ -754,7 +762,10 @@ def  test_tcp_tls_default_context():
 
         msgIn = bytes(beta.rxbs)
         assert msgIn == msgOut
+        remaining.append(ixBeta.tymer.remaining)
         beta.clearRxbs()
+
+        assert remaining == pytest.approx([1.0, 1.0])
 
     assert beta.opened == False
     assert server.opened == False
